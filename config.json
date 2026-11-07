@@ -1,0 +1,7 @@
+{
+  "title": "Blockmap",
+  "tileUrl": "tiles/{snapshot}/{dim}/{z}/{x}/{y}.png",
+  "minNativeZoom": -6,
+  "maxNativeZoom": 0,
+  "snapshots": []
+}

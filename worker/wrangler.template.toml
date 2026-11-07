@@ -1,0 +1,36 @@
+# Filled in by the Map site workflow (the names from tools/site_name.sh, and database_id). The site and map data are built into ../_site first.
+name = "__NAME__"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[assets]
+directory = "../_site"
+binding = "ASSETS"
+html_handling = "none"
+not_found_handling = "none"
+# The page itself and the api go through the worker (the invite check); everything else is served as plain files.
+run_worker_first = ["/", "/index.html", "/api/*"]
+
+# The Microsoft sign-in app shared by every Blockmap site (not a secret: it shows in the sign-in address anyway).
+[vars]
+MS_CLIENT_ID = "df3e3bed-2f3c-4079-8961-0c59d312c2fd"
+MS_RELAY = "https://tsow9.github.io/minecraft_be_livemap/login.html"
+# The GitHub repository this site comes from (owner/name): the timer below starts its live check.
+GH_REPO = "__REPO__"
+# Its id: a new repository of the same name (made again) does not take over the old one's timer.
+GH_REPO_ID = "__REPO_ID__"
+# The "Blockmap" GitHub App shared by every site (not secrets: its public client id and its name in GitHub's address).
+# The admin installs it on the repository and approves a code, and the timer starts the live check with that.
+GH_APP_CLIENT_ID = "Iv23li5jn6tfeGhFVOjt"
+GH_APP_SLUG = "blockmap-connect"
+
+# Every 10 minutes the site starts the repository's live check (GitHub's own timer often runs hours late), once the
+# admin has given it a GitHub token that may only start that repository's runs (admin menu).
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__DB_NAME__"
+database_id = "__DB_ID__"

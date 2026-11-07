@@ -1,0 +1,198 @@
+'use strict'
+const { t } = require('./msg')
+const crypto = require('crypto')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { Authflow, Titles } = require('prismarine-auth')
+const { RealmAPI } = require('prismarine-realms')
+const { pack, unpack } = require('./secure-cache')
+const { gamertags } = require('./xbox')
+
+const ENC_FILE = path.resolve(process.env.AUTH_FILE || '.auth/token.enc')
+const SECRET = process.env.CACHE_KEY
+const REALMS_RELYING_PARTY = 'https://pocket.realms.minecraft.net/'
+
+function tempCacheDir () {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-auth-'))
+}
+
+function makeAuth (cacheDir, onCode) {
+  return new Authflow('mcmap', cacheDir, { flow: 'live', authTitle: Titles.MinecraftNintendoSwitch, deviceType: 'Nintendo' }, onCode)
+}
+
+function makeApi (auth) {
+  const options = {}
+  if (process.env.MC_VERSION) options.minecraftVersion = process.env.MC_VERSION
+  return RealmAPI.from(auth, 'bedrock', options)
+}
+
+function snapshotDir (dir) {
+  return fs.readdirSync(dir).sort().map(n => n + fs.readFileSync(path.join(dir, n), 'utf8')).join('\n')
+}
+
+// Runs fn(auth, api) with the saved login; re-saves the encrypted tokens only if they were refreshed.
+async function withSavedLogin (fn) {
+  if (!fs.existsSync(ENC_FILE)) {
+    throw new Error(t('ログイン情報がありません。Actions の「Map site」から「Sign in to Realms」を実行してください', 'Not signed in. Run "Sign in to Realms" from "Map site" in Actions'))
+  }
+  const dir = tempCacheDir()
+  try {
+    unpack(ENC_FILE, dir, SECRET)
+    const before = snapshotDir(dir)
+    // Never show a sign-in code from an unattended job; ask for a manual login instead.
+    const auth = makeAuth(dir, () => {
+      console.error(t('ログインの有効期限が切れました。「Sign in to Realms」をもう一度実行してください', 'The sign-in has expired. Run "Sign in to Realms" again'))
+      process.exit(1)
+    })
+    const result = await fn(auth, makeApi(auth))
+    if (snapshotDir(dir) !== before) pack(dir, ENC_FILE, SECRET)
+    return result
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// Picks the realm this account owns. REALM_NAME narrows it down when there are several.
+// The Realms this account owns (only an owner can download the world).
+async function ownedRealms (api, auth) {
+  const realms = await api.getRealms()
+  const xuid = (await auth.getXboxToken(REALMS_RELYING_PARTY)).userXUID
+  const owned = realms.filter(r => (xuid && r.ownerUUID === xuid) || r.member === false)
+  return owned.length ? owned : realms
+}
+
+// The Realm this site maps: the only one owned, else the one named in REALM_NAME (a repository variable), else the
+// one picked on the setup page (REALM_PICK, kept in the site's database; tools/realms_key.sh hands it over).
+async function pickOwnedRealm (api, auth) {
+  let owned = await ownedRealms(api, auth)
+  const wanted = (process.env.REALM_NAME || process.env.REALM_PICK || '').trim()
+  if (wanted) owned = owned.filter(r => r.name === wanted)
+  if (owned.length === 0) throw new Error(t('自分が持ち主のRealmが見つかりませんでした', 'No Realm owned by this account was found'))
+  if (owned.length > 1) {
+    throw new Error(t(`Realmが${owned.length}個あります。リポジトリの Variables に REALM_NAME(Realmの名前)を設定してください`, `There are ${owned.length} Realms. Set REALM_NAME (the Realm's name) in the repository's Variables`))
+  }
+  return owned[0]
+}
+
+// Keyed hash so the public data never contains raw Xbox IDs.
+function hashId (value) {
+  return crypto.createHmac('sha256', SECRET).update(String(value)).digest('hex').slice(0, 16)
+}
+
+// The id the map site on Cloudflare checks a Microsoft sign-in against (worker/worker.js holds MEMBER_KEY, made the
+// same way by tools/site_keys.py). It shows nobody's XUID.
+const MEMBER_KEY = SECRET ? crypto.createHmac('sha256', SECRET).update('blockmap member').digest('hex') : ''
+function siteId (xuid) {
+  return crypto.createHmac('sha256', MEMBER_KEY).update(String(xuid)).digest('hex').slice(0, 32)
+}
+
+// The id the game itself gives an Xbox account (a name-based UUID made from the XUID), as 32 hex digits.
+// The world keeps it in each player_<id> record (MsaId), next to that player's record (ServerId).
+function gameIdentity (xuid) {
+  const b = crypto.createHash('md5').update(`pocket-auth-1-xuid:${xuid}`).digest()
+  b[6] = (b[6] & 0x0f) | 0x30
+  b[8] = (b[8] & 0x3f) | 0x80
+  return b.toString('hex')
+}
+
+// Realms reports lastLogin in epoch seconds; accept milliseconds or ISO strings too.
+function toMillis (v) {
+  if (v == null) return null
+  const n = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v)
+  return Number.isFinite(n) ? n : null
+}
+
+async function realmMembers (api, auth, realmId) {
+  return (await realmStatus(api, auth, realmId)).members
+}
+
+// Settings of the Realm worth showing on the map site. No IDs; names are the ones members already see in game.
+const RULES = ['keepInventory', 'pvp', 'showCoordinates', 'mobGriefing', 'doImmediateRespawn', 'playersSleepingPercentage',
+  'doFireTick', 'tntExplodes', 'naturalRegeneration', 'showDeathMessages', 'doDayLightCycle', 'doWeatherCycle']
+function realmInfo (realm) {
+  const slot = (realm.slots || []).find(s => s.slotId === realm.activeSlot)
+  let opts = {}
+  try { opts = typeof slot?.options === 'string' ? JSON.parse(slot.options) : (slot?.options || {}) } catch { opts = {} }
+  const settings = opts.worldSettings || {}
+  const rules = {}
+  for (const k of RULES) {
+    const v = settings[k]?.value
+    if (typeof v === 'boolean' || typeof v === 'number') rules[k] = v
+  }
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  return {
+    name: String(realm.name || '').slice(0, 100),
+    motd: String(realm.motd || '').slice(0, 300),
+    open: realm.state === 'OPEN',
+    daysLeft: num(realm.daysLeft),
+    expired: realm.expired === true,
+    maxPlayers: num(realm.maxPlayers),
+    slot: num(realm.activeSlot),
+    slotName: typeof opts.slotName === 'string' ? opts.slotName.slice(0, 100) : null,
+    difficulty: num(opts.difficulty),
+    gameMode: num(opts.gameMode),
+    hardcore: opts.hardcore === true,
+    cheats: opts.cheatsAllowed === true,
+    rules
+  }
+}
+
+// Realm backups: how many, and when the newest was made.
+async function realmBackups (api, realm) {
+  const backups = await api.getRealmBackups(realm.id, realm.activeSlot)
+  const times = backups.map(b => toMillis(b.lastModifiedDate)).filter(Boolean)
+  return { count: backups.length, latest: times.length ? Math.max(...times) : null }
+}
+
+// Members and Realm settings from a single lookup.
+async function realmStatus (api, auth, realmId, withBackups = false) {
+  const realm = await api.getRealm(realmId)
+  const info = realmInfo(realm)
+  if (withBackups) {
+    info.extrasAt = Date.now()
+    try { info.backups = await realmBackups(api, realm) } catch (e) { console.error(t('バックアップ情報を取得できませんでした:', 'Could not get the backups:'), e.message) }
+    try {
+      const sub = await api.getRealmSubscriptionInfo(realm.id)
+      info.subscription = { start: toMillis(sub.startDate), daysLeft: typeof sub.daysLeft === 'number' ? sub.daysLeft : null, type: String(sub.subscriptionType || '').slice(0, 30) }
+    } catch (e) { console.error(t('契約情報を取得できませんでした:', 'Could not get the subscription:'), e.message) }
+    // The detailed form (store, end date, renewal period) answers only for some accounts; keep it when it does.
+    try {
+      const d = await api.rest.get(`/subscriptions/${realm.id}/details`)
+      const text = (v) => (v == null ? null : String(v).slice(0, 40))
+      info.billing = {
+        store: text(d.store), type: text(d.type), renewal: text(d.renewalPeriod),
+        start: toMillis(d.startDate), end: toMillis(d.endDate),
+        daysLeft: typeof d.daysLeft === 'number' ? d.daysLeft : null,
+        product: text(d.productId), variant: text(d.productVariantId)
+      }
+    } catch (e) { console.error(t('契約の詳細を取得できませんでした:', 'Could not get the subscription details:'), e.message) }
+  }
+  const { members, names } = await memberList(auth, realm)
+  // The owner's gamertag (the account the map uses), looked up together with the members' names.
+  const owner = names[realm.ownerUUID] || realm.owner
+  info.owner = owner ? String(owner).slice(0, 40) : null
+  // The site's owner (the account the map uses, which set the site up) manages who may write on the site.
+  info.ownerXid = realm.ownerUUID ? siteId(realm.ownerUUID) : null
+  return { members, realm: info }
+}
+
+async function memberList (auth, realm) {
+  const players = (realm.players || []).filter(p => p.uuid)
+  let names = {}
+  try {
+    names = await gamertags(auth, [...new Set([...players.map(p => p.uuid), realm.ownerUUID].filter(Boolean))])
+  } catch (e) {
+    console.error(e.message)
+  }
+  return { names, members: players.map(p => ({
+    id: hashId(p.uuid),
+    identity: hashId(gameIdentity(p.uuid)),
+    xid: siteId(p.uuid),
+    name: names[p.uuid] || p.name || null,
+    online: p.online === true,
+    lastLogin: toMillis(p.lastLogin)
+  })) }
+}
+
+module.exports = { ENC_FILE, SECRET, REALMS_RELYING_PARTY, tempCacheDir, makeAuth, makeApi, withSavedLogin, ownedRealms, pickOwnedRealm, realmMembers, realmStatus }

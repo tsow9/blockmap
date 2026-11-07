@@ -1,0 +1,12 @@
+__pycache__/
+node_modules/
+.auth/
+data/
+_site/
+*.mcworld
+share/wrangler.toml
+share/.dev.vars
+share/.wrangler/
+worker/wrangler.toml
+worker/.dev.vars
+worker/.wrangler/

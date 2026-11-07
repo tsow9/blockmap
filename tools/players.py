@@ -1,0 +1,262 @@
+"""Player positions, online status, record-to-member matching, and explorer estimates.
+
+World player records (player_server_*) carry positions but no Xbox ID. Each one has a player_<id> record next to
+it holding the account's id in the game (MsaId, a UUID the game makes from the XUID), which ties it to a Realm
+member exactly. For records without one, we still learn the owner by matching "whose position moved" with
+"who was online" between checks.
+The state lives in live.json, which the site reads directly.
+"""
+import hashlib
+import hmac
+import math
+import string
+
+import bedrock_db
+import nbt
+
+DIM_NAMES = {0: 'overworld', 1: 'nether', 2: 'end'}
+BEFORE = '_'
+UNKNOWN = '?'
+TRAIL_MAX = 600
+RECORDS = 2  # how player records are read: raise it when that changes, and the live check reads the world again
+
+
+def _hash(secret, value):
+    return hmac.new(secret.encode(), value.encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def _identities(db_dir, secret):
+    """player_server_<id> key -> hashed game id of the account it belongs to (from the player_<id> records)."""
+    out = {}
+    for key, value in bedrock_db.scan(db_dir, lambda k: k.startswith(b'player_') and not k.startswith(b'player_server_')):
+        try:
+            root, _ = nbt.root_compound(value, 0)
+        except (KeyError, ValueError, IndexError):
+            continue
+        msa, server = root.get('MsaId'), root.get('ServerId')
+        if isinstance(msa, str) and msa and isinstance(server, str) and server:
+            server = server if server.startswith('player_server_') else f'player_server_{server}'
+            out[server] = _hash(secret, msa.lower().replace('-', ''))
+    return out
+
+
+def read_records(db_dir, secret):
+    out = []
+    identities = _identities(db_dir, secret)
+    for key, value in bedrock_db.scan(db_dir, lambda k: k.startswith(b'player_server_')):
+        try:
+            root, _ = nbt.root_compound(value, 0)
+            pos = root['Pos']
+        except (KeyError, ValueError, IndexError):
+            continue
+        rec = {
+            'key': _hash(secret, key.decode('latin-1')),
+            'dim': DIM_NAMES.get(root.get('DimensionId', 0), 'overworld'),
+            'x': math.floor(pos[0]), 'y': math.floor(pos[1] - 1.62), 'z': math.floor(pos[2]),
+            'death': None,
+            'identity': identities.get(key.decode('latin-1')),
+        }
+        # The bed (or respawn anchor) the player last used. Without one the game keeps -2147483648 there (and
+        # SpawnDimension 3); older worlds also said so with NaturalSpawn = 1.
+        spawn = [root.get(f'SpawnBlockPosition{a}') for a in 'XYZ']
+        if (all(isinstance(v, int) and abs(v) < 30_000_000 for v in spawn) and root.get('NaturalSpawn') != 1
+                and root.get('SpawnDimension') in (0, 1, 2)):
+            rec['bed'] = {
+                'dim': DIM_NAMES.get(root.get('SpawnDimension', 0), 'overworld'),
+                'x': spawn[0], 'y': spawn[1], 'z': spawn[2],
+            }
+        if root.get('HasDiedBefore') and 'DeathPositionX' in root:
+            rec['death'] = {
+                'dim': DIM_NAMES.get(root.get('DeathDimension', 0), 'overworld'),
+                'x': root['DeathPositionX'], 'y': root.get('DeathPositionY', 64), 'z': root['DeathPositionZ'],
+            }
+        out.append(rec)
+    return out
+
+
+def _label(i):
+    return 'プレイヤー' + (string.ascii_uppercase[i] if i < 26 else str(i + 1))
+
+
+def anyone_online(state, members):
+    """True if someone is online now or was at the last check (so we also catch where they logged out)."""
+    return any(m.get('online') for m in members) or any(m.get('online') for m in state.get('members', []))
+
+
+def _match(players, members, since):
+    # Exact: the world says which account each record belongs to.
+    by_identity = {m['identity']: m['id'] for m in members if m.get('identity')}
+    for p in players:
+        if by_identity.get(p.get('identity')):
+            p['member'] = by_identity[p['identity']]
+    linked = {p['member'] for p in players if p.get('member')}
+    moved = [p for p in players if not p.get('member') and p['_moved']]
+    active = [m for m in members if m['id'] not in linked and (
+        m.get('online') or (since and (m.get('lastLogin') or 0) > since))]
+    if len(moved) == 1 and len(active) == 1:
+        moved[0]['member'] = active[0]['id']
+        linked.add(active[0]['id'])
+    unlinked = [p for p in players if not p.get('member')]
+    ever_joined = [m for m in members if m.get('lastLogin') and m['id'] not in linked]
+    if len(unlinked) == 1 and len(ever_joined) == 1:
+        unlinked[0]['member'] = ever_joined[0]['id']
+
+
+def update_live(state, members, records, now):
+    """Merge a fresh member list (and, if given, fresh world player records) into the live state."""
+    prev_members = {m['id']: m for m in state.get('members', []) if m.get('id')}
+    merged = []
+    for m in members:
+        prev = prev_members.get(m['id'], {})
+        merged.append({**m, 'lastSeenOnline': now if m.get('online') else prev.get('lastSeenOnline')})
+    by_member = {m['id']: m for m in merged}
+
+    players = [p for p in state.get('players', []) if p.get('key')]
+    if records is not None:
+        prev_by_key = {p['key']: p for p in players}
+        players = []
+        for rec in records:
+            prev = prev_by_key.get(rec['key'], {})
+            moved = not prev or (prev['dim'], prev['x'], prev['z']) != (rec['dim'], rec['x'], rec['z'])
+            trail = list(prev.get('trail', []))
+            if moved:
+                trail = (trail + [[now, rec['dim'], rec['x'], rec['z']]])[-TRAIL_MAX:]
+            players.append({
+                **rec, '_moved': moved, 'member': prev.get('member'), 'label': prev.get('label'),
+                'movedAt': now if moved else prev.get('movedAt'), 'trail': trail,
+            })
+        used = {p['label'] for p in players if p['label']}
+        i = 0
+        for p in players:
+            if not p['label']:
+                while _label(i) in used:
+                    i += 1
+                p['label'] = _label(i)
+                used.add(p['label'])
+        _match(players, merged, state.get('worldAt'))
+        for p in players:
+            p.pop('_moved', None)
+        state['worldAt'] = now
+
+    for p in players:
+        m = by_member.get(p.get('member'))
+        p['name'] = (m or {}).get('name') or p['label']
+        p['online'] = m.get('online') if m else None
+        p['lastSeenOnline'] = m.get('lastSeenOnline') if m else None
+    state['members'] = merged
+    state['players'] = players
+    state['updatedAt'] = now
+    return state
+
+
+def _seg_dist(px, pz, a, b):
+    (ax, az), (bx, bz) = a, b
+    dx, dz = bx - ax, bz - az
+    if dx == 0 and dz == 0:
+        return math.hypot(px - ax, pz - az)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (pz - az) * dz) / (dx * dx + dz * dz)))
+    return math.hypot(px - (ax + t * dx), pz - (az + t * dz))
+
+
+def _paths(players, dim, since):
+    """Per player: the path walked in this dimension since `since` (plus the point just before it)."""
+    out = []
+    for p in players:
+        trail = p.get('trail', [])
+        recent = [t for t in trail if t[0] > since]
+        if not recent:
+            continue
+        earlier = [t for t in trail if t[0] <= since]
+        pts = ([earlier[-1]] if earlier else []) + recent
+        pts = [(t[2], t[3]) for t in pts if t[1] == dim]
+        if pts:
+            out.append((p['key'], pts))
+    return out
+
+
+# A chunk this far (in blocks) from every path walked since the last map is more likely the work of whoever has been
+# around it at other times (their older footprints, where they are now, their bed or last death).
+NEAR = 192
+
+
+def _known_points(players, dim):
+    """Per player: every place known for them in this dimension, at any time."""
+    out = {}
+    for p in players:
+        key = p.get('key')
+        if not key:
+            continue
+        pts = out.setdefault(key, set())
+        pts.update((t[2] // 16, t[3] // 16) for t in p.get('trail', []) if len(t) >= 4 and t[1] == dim)
+        if p.get('dim') == dim and isinstance(p.get('x'), int):
+            pts.add((p['x'] // 16, p['z'] // 16))
+        for k in ('bed', 'death'):
+            b = p.get(k)
+            if isinstance(b, dict) and b.get('dim') == dim and isinstance(b.get('x'), int):
+                pts.add((b['x'] // 16, b['z'] // 16))
+    return [(k, sorted(v)) for k, v in out.items() if v]
+
+
+def attribute(new_chunks, dim, players, since, others=()):
+    """Give each newly appeared chunk to the player whose recent path passed closest to it; failing that (no path
+    near it, as when the live check was not running), to whoever has otherwise been closest to it. `others` are more
+    player records (from the world itself) for the second look. Unknown only when nobody was ever seen in this
+    dimension."""
+    paths = _paths(players, dim, since)
+    wide = _known_points(list(players) + list(others), dim)
+    if not paths and not wide:
+        return {c: UNKNOWN for c in new_chunks}
+    out, far = {}, []
+    for cx, cz in new_chunks:
+        px, pz = cx * 16 + 8, cz * 16 + 8
+        best, best_d = None, float('inf')
+        for key, pts in paths:
+            segs = list(zip(pts, pts[1:])) or [(pts[0], pts[0])]
+            d = min(_seg_dist(px, pz, a, b) for a, b in segs)
+            if d < best_d:
+                best, best_d = key, d
+        out[(cx, cz)] = best or UNKNOWN
+        if best_d > NEAR:
+            far.append(((cx, cz), best_d))
+    if far and wide:
+        import numpy as np
+        cells = np.array([c for c, _ in far], dtype=np.float64)
+        best_d = np.array([d for _, d in far], dtype=np.float64)
+        best = [None] * len(far)
+        for key, pts in wide:
+            ref = np.array(pts, dtype=np.float64)
+            for i in range(0, len(cells), 2000):  # in parts, to keep memory small
+                part = cells[i:i + 2000]
+                d = np.sqrt(((part[:, None, :] - ref[None, :, :]) ** 2).sum(-1).min(1)) * 16
+                closer = d < best_d[i:i + 2000]
+                best_d[i:i + 2000][closer] = d[closer]
+                for j in np.nonzero(closer)[0]:
+                    best[i + j] = key
+        for (c, _), key in zip(far, best):
+            if key:
+                out[c] = key
+    return out
+
+
+def update_explore(explore, chunk_sets, live_state, now, world_players=()):
+    """Add chunks that appeared since the last run; the very first run marks everything as BEFORE. Chunks left
+    unknown before are looked at again (more is known now)."""
+    first = explore is None
+    explore = explore or {'dims': {}}
+    since = explore.get('updatedAt') or 0
+    players = (live_state or {}).get('players', [])
+    added = 0
+    for dim, chunks in chunk_sets.items():
+        by_owner = explore['dims'].setdefault(dim, {})
+        unknown = {(c[0], c[1]) for c in by_owner.pop(UNKNOWN, [])}
+        known = {(c[0], c[1]) for cs in by_owner.values() for c in cs}
+        new = chunks - known - unknown
+        if first:
+            owners = {c: BEFORE for c in new}
+        else:
+            owners = attribute(new | (unknown & chunks), dim, players, since, world_players)
+        for c, owner in owners.items():
+            by_owner.setdefault(owner, []).append([c[0], c[1]])
+        added += 0 if first else len(new)
+    explore['updatedAt'] = now
+    return explore, added
